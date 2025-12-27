@@ -272,7 +272,7 @@ def main():
     from datetime import date
     import pandas as pd
 
-    start_date, end_date = date.today() - relativedelta(years=1), date.today().strftime("%Y-%m-%d")
+    start_date, end_date = date.today() - relativedelta(years=3), date.today().strftime("%Y-%m-%d")
     name1 = 'Basket A'
     name2 = 'Basket B'
     path = '~/Code/stock_analysis/'

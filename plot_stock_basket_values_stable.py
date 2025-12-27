@@ -27,11 +27,21 @@ def load_basket(file_path):
     else:
         raise ValueError("Only CSV and XLSX files are supported.")
 
-    required_columns = {'Ticker', 'Purchase Date', 'Purchase Price', 'Quantity'}
+    required_columns = {'Ticker', 'Transaction Date', 'Transaction Type', 'Quantity'}
     if not required_columns.issubset(df.columns):
         raise ValueError(f"Input file must include the columns: {required_columns}")
 
-    df['Purchase Date'] = pd.to_datetime(df['Purchase Date'])
+    df['Transaction Date'] = pd.to_datetime(df['Transaction Date'])
+
+    # Validate Transaction Type
+    valid_types = {'Buy', 'Sell'}
+    invalid_types = set(df['Transaction Type'].unique()) - valid_types
+    if invalid_types:
+        raise ValueError(f"Invalid Transaction Type values: {invalid_types}. Must be 'Buy' or 'Sell'")
+
+    # Sort by transaction date (chronological order)
+    df = df.sort_values('Transaction Date').reset_index(drop=True)
+
     return df
 
 
@@ -183,17 +193,82 @@ def download_stock_data(tickers, start_date, end_date):
         raise RuntimeError("No data could be downloaded from any source.")
     return data
 
-def compute_basket_value(basket_df, data, purchase_date):
+
+def build_position_history(basket_df, date_index):
+    """
+    Build a time series of stock holdings based on transaction history.
+
+    The initial positions (from the first transaction date) are projected backwards
+    across the entire data range to show hypothetical historical performance.
+
+    Args:
+        basket_df: DataFrame with columns 'Ticker', 'Transaction Date', 'Transaction Type', 'Quantity'
+        date_index: DatetimeIndex from price data
+
+    Returns:
+        DataFrame with index=date_index, columns=tickers, values=quantity held at each date
+    """
+    # Get unique tickers
+    tickers = basket_df['Ticker'].unique()
+
+    # Initialize position history with zeros
+    position_history = pd.DataFrame(0.0, index=date_index, columns=tickers)
+
+    # Find the earliest transaction date (initial purchase date)
+    first_txn_date = basket_df['Transaction Date'].min()
+
+    # Build initial positions from first transaction date
+    initial_positions = {}
+    for ticker in tickers:
+        ticker_transactions = basket_df[basket_df['Ticker'] == ticker].copy()
+
+        # Get all transactions on the first transaction date
+        initial_txns = ticker_transactions[ticker_transactions['Transaction Date'] == first_txn_date]
+        initial_position = 0.0
+        for _, txn in initial_txns.iterrows():
+            quantity = float(txn['Quantity'])
+            if txn['Transaction Type'] == 'Buy':
+                initial_position += quantity
+            elif txn['Transaction Type'] == 'Sell':
+                initial_position -= quantity
+        initial_positions[ticker] = initial_position
+
+    # Project initial positions backwards across entire date range
+    for ticker in tickers:
+        position_history[ticker] = initial_positions[ticker]
+
+    # Now apply subsequent transactions (after the first transaction date)
+    for ticker in tickers:
+        ticker_transactions = basket_df[basket_df['Ticker'] == ticker].copy()
+
+        # Process transactions after the first date
+        subsequent_txns = ticker_transactions[ticker_transactions['Transaction Date'] > first_txn_date]
+        for _, txn in subsequent_txns.iterrows():
+            txn_date = txn['Transaction Date']
+            quantity = float(txn['Quantity'])
+            txn_type = txn['Transaction Type']
+
+            # Apply the transaction to all dates >= transaction date
+            mask = position_history.index >= txn_date
+            if txn_type == 'Buy':
+                position_history.loc[mask, ticker] += quantity
+            elif txn_type == 'Sell':
+                position_history.loc[mask, ticker] -= quantity
+
+    return position_history
+
+
+def compute_basket_value(basket_df, data):
     import pandas as pd
+
+    # Build position history over time
+    position_history = build_position_history(basket_df, data.index)
 
     stock_values = pd.DataFrame(index=data.index)
     stock_prices = pd.DataFrame(index=data.index)
-    quantities = {}
 
-    for _, row in basket_df.iterrows():
-        ticker = str(row['Ticker']).strip()
-        quantity = float(row['Quantity'])
-
+    # Extract prices and calculate values for each ticker
+    for ticker in position_history.columns:
         if ticker not in data.columns:
             continue
 
@@ -202,36 +277,71 @@ def compute_basket_value(basket_df, data, purchase_date):
         else:
             price_series = data[ticker]
 
-        value_series = price_series * quantity
+        # Value = position × price at each date
+        value_series = position_history[ticker] * price_series
 
         stock_values[ticker] = value_series
         stock_prices[ticker] = price_series
-        quantities[ticker] = quantity
 
     stock_values.fillna(0, inplace=True)
     basket_value = stock_values.sum(axis=1)
 
-    # Compute gains relative to the basket value at purchase_date
-    if purchase_date not in basket_value.index:
-        if purchase_date < basket_value.index.min():
-            print(f"⚠️ Warning: Purchase date {purchase_date.date()} is before available data range starting {basket_value.index.min().date()}. Using first available date instead.")
-            purchase_date = basket_value.index.min()
-        elif purchase_date > basket_value.index.max():
-            print(f"⚠️ Warning: Purchase date {purchase_date.date()} is after available data range ending {basket_value.index.max().date()}. Using last available date instead.")
-            purchase_date = basket_value.index.max()
+    # Find baseline dates for percentage calculations
+    # Basket baseline: earliest transaction date
+    basket_baseline_date = basket_df['Transaction Date'].min()
+
+    # Find first Buy transaction date for each ticker (for per-stock percentages)
+    ticker_baselines = {}
+    for ticker in position_history.columns:
+        ticker_buys = basket_df[(basket_df['Ticker'] == ticker) & (basket_df['Transaction Type'] == 'Buy')]
+        if not ticker_buys.empty:
+            ticker_baselines[ticker] = ticker_buys['Transaction Date'].min()
+
+    # Adjust baseline date if not in data range
+    if basket_baseline_date not in basket_value.index:
+        if basket_baseline_date < basket_value.index.min():
+            print(f"⚠️ Warning: Earliest transaction date {basket_baseline_date.date()} is before available data range starting {basket_value.index.min().date()}. Using first available date instead.")
+            basket_baseline_date = basket_value.index.min()
+        elif basket_baseline_date > basket_value.index.max():
+            print(f"⚠️ Warning: Earliest transaction date {basket_baseline_date.date()} is after available data range ending {basket_value.index.max().date()}. Using last available date instead.")
+            basket_baseline_date = basket_value.index.max()
         else:
             # Use nearest available date if it's within range but not exactly matched (e.g., weekend)
-            purchase_date = basket_value.index[basket_value.index.get_indexer([purchase_date], method='nearest')[0]]
+            basket_baseline_date = basket_value.index[basket_value.index.get_indexer([basket_baseline_date], method='nearest')[0]]
 
-    initial_value = basket_value.loc[purchase_date]
-    basket_pct = (basket_value / initial_value - 1) * 100
+    # Calculate basket percentage gain from baseline
+    initial_value = basket_value.loc[basket_baseline_date]
+    if initial_value > 0:
+        basket_pct = (basket_value / initial_value - 1) * 100
+    else:
+        basket_pct = pd.Series(0, index=basket_value.index)
 
-    initial_prices = stock_prices.loc[purchase_date]
-    stock_pct = (stock_prices.divide(initial_prices) - 1) * 100
+    # Calculate per-stock percentage gains from their respective baselines
+    stock_pct = pd.DataFrame(index=data.index, columns=stock_prices.columns)
+    for ticker in stock_prices.columns:
+        if ticker in ticker_baselines:
+            baseline_date = ticker_baselines[ticker]
 
-    return basket_value, stock_values, stock_prices, quantities, basket_pct, stock_pct
+            # Adjust baseline date if needed
+            if baseline_date not in stock_prices.index:
+                if baseline_date < stock_prices.index.min():
+                    baseline_date = stock_prices.index.min()
+                elif baseline_date > stock_prices.index.max():
+                    baseline_date = stock_prices.index.max()
+                else:
+                    baseline_date = stock_prices.index[stock_prices.index.get_indexer([baseline_date], method='nearest')[0]]
 
-def make_hover_trace(total_series, name, stock_prices, stock_values, quantities, show_date=False, stock_pct=None, basket_pct=None):
+            initial_price = stock_prices.loc[baseline_date, ticker]
+            if pd.notna(initial_price) and initial_price > 0:
+                stock_pct[ticker] = (stock_prices[ticker] / initial_price - 1) * 100
+            else:
+                stock_pct[ticker] = 0
+        else:
+            stock_pct[ticker] = 0
+
+    return basket_value, stock_values, stock_prices, position_history, basket_pct, stock_pct
+
+def make_hover_trace(total_series, name, stock_prices, stock_values, position_history, show_date=False, stock_pct=None, basket_pct=None):
     hover_data = []
     for dt in total_series.index:
         lines = []
@@ -249,11 +359,11 @@ def make_hover_trace(total_series, name, stock_prices, stock_values, quantities,
         for ticker in stock_values.columns:
             price = stock_prices.at[dt, ticker] if dt in stock_prices.index else None
             value = stock_values.at[dt, ticker] if dt in stock_values.index else None
-            quantity = quantities.get(ticker, None)
+            position = position_history.at[dt, ticker] if dt in position_history.index and ticker in position_history.columns else None
             pct_change = stock_pct.at[dt, ticker] if stock_pct is not None and ticker in stock_pct.columns else None
-            if pd.notna(price) and pd.notna(value) and quantity:
+            if pd.notna(price) and pd.notna(value) and pd.notna(position) and position != 0:
                 lines.append(
-                    f"{ticker}: {quantity} × ${price:.2f} = ${value:,.0f} ({pct_change:+.1f}%)"
+                    f"{ticker}: {position:.2f} × ${price:.2f} = ${value:,.0f} ({pct_change:+.1f}%)"
                 )
 
         hover_data.append("<br>".join(lines))
@@ -282,25 +392,18 @@ def main():
     basket1 = load_basket(file1)
     basket2 = load_basket(file2)
 
-    # Determine and check purchase dates
-    purchase_date1 = pd.to_datetime(basket1['Purchase Date'].iloc[0])
-    purchase_date2 = pd.to_datetime(basket2['Purchase Date'].iloc[0])
-
-    assert (basket1['Purchase Date'] == purchase_date1.strftime('%Y-%m-%d')).all(), "Inconsistent purchase dates in Basket A"
-    assert (basket2['Purchase Date'] == purchase_date2.strftime('%Y-%m-%d')).all(), "Inconsistent purchase dates in Basket B"
-
     all_tickers = pd.concat([basket1, basket2])['Ticker'].unique().tolist()
     print("✅ Ready to download data for:", all_tickers)
 
     data = download_stock_data(all_tickers, start_date, end_date)
 
-    value1, values1, prices1, qtys1, pct1, stockpct1 = compute_basket_value(basket1, data, purchase_date1)
-    value2, values2, prices2, qtys2, pct2, stockpct2 = compute_basket_value(basket2, data, purchase_date2)
+    value1, values1, prices1, positions1, pct1, stockpct1 = compute_basket_value(basket1, data)
+    value2, values2, prices2, positions2, pct2, stockpct2 = compute_basket_value(basket2, data)
 
     fig = go.Figure()
 
-    fig.add_trace(make_hover_trace(value1, name1, prices1, values1, qtys1, show_date=True, stock_pct=stockpct1, basket_pct=pct1))
-    fig.add_trace(make_hover_trace(value2, name2, prices2, values2, qtys2, show_date=False, stock_pct=stockpct2, basket_pct=pct2))
+    fig.add_trace(make_hover_trace(value1, name1, prices1, values1, positions1, show_date=True, stock_pct=stockpct1, basket_pct=pct1))
+    fig.add_trace(make_hover_trace(value2, name2, prices2, values2, positions2, show_date=False, stock_pct=stockpct2, basket_pct=pct2))
 
     # Add percent gain traces on secondary y-axis
     fig.add_trace(go.Scatter(

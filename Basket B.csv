@@ -1,2 +1,4 @@
-Ticker,Transaction Date,Transaction Type,Transaction Price,Quantity
-GLD,4/9/25,Buy,284.4517,731
+Ticker,Transaction Date,Transaction Type,Transaction Price,Quantity,Value
+GLD,4/9/25,Buy,284.4517,731," $207,934.19 "
+GLD,12/17/25,Sell,398.5,50," $19,925.00 "
+GLD,1/29/26,Sell,507.6001,88," $44,668.81 "

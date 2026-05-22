@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from datetime import date
@@ -6,6 +7,10 @@ from dateutil.relativedelta import relativedelta
 import time
 import requests
 import os
+import warnings
+
+# Suppress numerical solver warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
 # === CONFIG ===
@@ -194,6 +199,7 @@ def download_stock_data(tickers, start_date, end_date):
     return data
 
 
+
 def build_position_history(basket_df, date_index):
     """
     Build a time series of stock holdings based on transaction history.
@@ -258,11 +264,86 @@ def build_position_history(basket_df, date_index):
     return position_history
 
 
-def compute_basket_value(basket_df, data):
+def build_sold_amounts_history(basket_df, date_index):
+    """
+    Build a time series of cumulative sold amounts based on transaction history.
+
+    Args:
+        basket_df: DataFrame with columns 'Ticker', 'Transaction Date', 'Transaction Type', 'Quantity'
+        date_index: DatetimeIndex from price data
+
+    Returns:
+        DataFrame with index=date_index, columns=tickers, values=cumulative dollar value sold at each date
+    """
+    tickers = basket_df['Ticker'].unique()
+    sold_history = pd.DataFrame(0.0, index=date_index, columns=tickers)
+
+    for ticker in tickers:
+        ticker_transactions = basket_df[basket_df['Ticker'] == ticker].copy()
+        cumulative_sold = 0.0
+
+        for _, txn in ticker_transactions.iterrows():
+            if txn['Transaction Type'] == 'Sell':
+                txn_date = txn['Transaction Date']
+                quantity = float(txn['Quantity'])
+
+                # Use Transaction Price if available
+                if 'Transaction Price' in txn.index and pd.notna(txn['Transaction Price']):
+                    price = float(txn['Transaction Price'])
+                    sold_amount = quantity * price
+                    cumulative_sold += sold_amount
+
+                    # Apply this cumulative sold amount to all dates >= transaction date
+                    mask = sold_history.index >= txn_date
+                    sold_history.loc[mask, ticker] = cumulative_sold
+
+    return sold_history
+
+
+def compute_trailing_6mo_annualized_pct(series, start_date=pd.Timestamp('2025-10-10')):
+    """Compute trailing 6-month percent change, annualized to 1 year, for dates >= start_date."""
+    result = pd.Series(np.nan, index=series.index)
+    for dt in series.index:
+        if dt < start_date:
+            continue
+        target = dt - pd.DateOffset(months=6)
+        idx = series.index.asof(target)
+        if pd.isna(idx):
+            continue
+        base_val = series.loc[idx]
+        if base_val != 0:
+            six_mo_return = series.loc[dt] / base_val - 1
+            annualized = (1 + six_mo_return) ** 2 - 1
+            result.loc[dt] = annualized * 100
+    return result
+
+
+def compute_trailing_1yr_pct(series, start_date=pd.Timestamp('2026-04-10')):
+    """Compute trailing 1-year percent change for dates >= start_date."""
+    result = pd.Series(np.nan, index=series.index)
+    for dt in series.index:
+        if dt < start_date:
+            continue
+        target = dt - pd.DateOffset(years=1)
+        idx = series.index.asof(target)
+        if pd.isna(idx):
+            continue
+        base_val = series.loc[idx]
+        if base_val != 0:
+            result.loc[dt] = (series.loc[dt] / base_val - 1) * 100
+    return result
+
+
+def compute_basket_value(basket_df, data, include_sold_value=False):
     import pandas as pd
 
     # Build position history over time
     position_history = build_position_history(basket_df, data.index)
+
+    # Build sold amounts history if requested
+    sold_history = None
+    if include_sold_value:
+        sold_history = build_sold_amounts_history(basket_df, data.index)
 
     stock_values = pd.DataFrame(index=data.index)
     stock_prices = pd.DataFrame(index=data.index)
@@ -286,62 +367,77 @@ def compute_basket_value(basket_df, data):
     stock_values.fillna(0, inplace=True)
     basket_value = stock_values.sum(axis=1)
 
-    # Find baseline dates for percentage calculations
-    # Basket baseline: earliest transaction date
-    basket_baseline_date = basket_df['Transaction Date'].min()
+    # Add sold amounts if requested (for display only, not for MWR calculation)
+    display_basket_value = basket_value.copy()
+    display_stock_values = stock_values.copy()
+    if include_sold_value and sold_history is not None:
+        # Add sold amounts to display values
+        display_stock_values = display_stock_values + sold_history
+        display_basket_value = display_stock_values.sum(axis=1)
 
-    # Find first Buy transaction date for each ticker (for per-stock percentages)
-    ticker_baselines = {}
-    for ticker in position_history.columns:
-        ticker_buys = basket_df[(basket_df['Ticker'] == ticker) & (basket_df['Transaction Type'] == 'Buy')]
-        if not ticker_buys.empty:
-            ticker_baselines[ticker] = ticker_buys['Transaction Date'].min()
+    # Calculate simple percentage gain:
+    # % gain = (current_holdings_value + cumulative_sell_proceeds) / total_invested - 1
+    stock_pct = pd.DataFrame(0.0, index=data.index, columns=stock_prices.columns)
+    total_invested = pd.Series(0.0, index=data.index)
+    total_sold = pd.Series(0.0, index=data.index)
 
-    # Adjust baseline date if not in data range
-    if basket_baseline_date not in basket_value.index:
-        if basket_baseline_date < basket_value.index.min():
-            print(f"⚠️ Warning: Earliest transaction date {basket_baseline_date.date()} is before available data range starting {basket_value.index.min().date()}. Using first available date instead.")
-            basket_baseline_date = basket_value.index.min()
-        elif basket_baseline_date > basket_value.index.max():
-            print(f"⚠️ Warning: Earliest transaction date {basket_baseline_date.date()} is after available data range ending {basket_value.index.max().date()}. Using last available date instead.")
-            basket_baseline_date = basket_value.index.max()
-        else:
-            # Use nearest available date if it's within range but not exactly matched (e.g., weekend)
-            basket_baseline_date = basket_value.index[basket_value.index.get_indexer([basket_baseline_date], method='nearest')[0]]
+    print("📊 Calculating percentage gains...")
 
-    # Calculate basket percentage gain from baseline
-    initial_value = basket_value.loc[basket_baseline_date]
-    if initial_value > 0:
-        basket_pct = (basket_value / initial_value - 1) * 100
-    else:
-        basket_pct = pd.Series(0, index=basket_value.index)
-
-    # Calculate per-stock percentage gains from their respective baselines
-    stock_pct = pd.DataFrame(index=data.index, columns=stock_prices.columns)
     for ticker in stock_prices.columns:
-        if ticker in ticker_baselines:
-            baseline_date = ticker_baselines[ticker]
+        ticker_txns = basket_df[basket_df['Ticker'] == ticker].sort_values('Transaction Date')
+        cum_invested = 0.0
+        cum_sold = 0.0
+        txn_events = []  # (date, cum_invested, cum_sold)
 
-            # Adjust baseline date if needed
-            if baseline_date not in stock_prices.index:
-                if baseline_date < stock_prices.index.min():
-                    baseline_date = stock_prices.index.min()
-                elif baseline_date > stock_prices.index.max():
-                    baseline_date = stock_prices.index.max()
-                else:
-                    baseline_date = stock_prices.index[stock_prices.index.get_indexer([baseline_date], method='nearest')[0]]
-
-            initial_price = stock_prices.loc[baseline_date, ticker]
-            if pd.notna(initial_price) and initial_price > 0:
-                stock_pct[ticker] = (stock_prices[ticker] / initial_price - 1) * 100
+        for _, txn in ticker_txns.iterrows():
+            quantity = float(txn['Quantity'])
+            if 'Transaction Price' in txn.index and pd.notna(txn['Transaction Price']):
+                price = float(txn['Transaction Price'])
+            elif txn['Transaction Date'] in stock_prices.index:
+                price = stock_prices.loc[txn['Transaction Date'], ticker]
+                if pd.isna(price):
+                    continue
             else:
-                stock_pct[ticker] = 0
-        else:
-            stock_pct[ticker] = 0
+                continue
+            if txn['Transaction Type'] == 'Buy':
+                cum_invested += quantity * price
+            elif txn['Transaction Type'] == 'Sell':
+                cum_sold += quantity * price
+            txn_events.append((txn['Transaction Date'], cum_invested, cum_sold))
 
-    return basket_value, stock_values, stock_prices, position_history, basket_pct, stock_pct
+        if not txn_events:
+            continue
 
-def make_hover_trace(total_series, name, stock_prices, stock_values, position_history, show_date=False, stock_pct=None, basket_pct=None):
+        # Build time series of cumulative invested/sold for this ticker
+        inv_series = pd.Series(0.0, index=data.index)
+        sold_series = pd.Series(0.0, index=data.index)
+        for txn_date, ci, cs in txn_events:
+            mask = data.index >= txn_date
+            inv_series.loc[mask] = ci
+            sold_series.loc[mask] = cs
+
+        # Per-stock % gain
+        has_investment = inv_series > 0
+        stock_pct.loc[has_investment, ticker] = (
+            (stock_values[ticker][has_investment] + sold_series[has_investment])
+            / inv_series[has_investment] - 1
+        ) * 100
+
+        # Accumulate into basket-level totals
+        total_invested += inv_series
+        total_sold += sold_series
+
+    # Basket-level % gain
+    has_investment = total_invested > 0
+    basket_pct = pd.Series(0.0, index=data.index)
+    basket_pct.loc[has_investment] = (
+        (basket_value[has_investment] + total_sold[has_investment])
+        / total_invested[has_investment] - 1
+    ) * 100
+
+    return display_basket_value, display_stock_values, stock_prices, position_history, basket_pct, stock_pct
+
+def make_hover_trace(total_series, name, stock_prices, stock_values, position_history, show_date=False, stock_pct=None, basket_pct=None, basket_1yr_pct=None, stock_1yr_pct=None, basket_6mo_pct=None, stock_6mo_pct=None, line_color=None):
     hover_data = []
     for dt in total_series.index:
         lines = []
@@ -352,7 +448,13 @@ def make_hover_trace(total_series, name, stock_prices, stock_values, position_hi
         basket_total = total_series.at[dt]
         if basket_pct is not None:
             basket_change = basket_pct.at[dt]
-            lines.append(f"<b>{name}: ${basket_total:,.0f} ({basket_change:+.1f}%)</b>")
+            line = f"<b>{name}: ${basket_total:,.0f} ({basket_change:+.1f}%)"
+            if basket_6mo_pct is not None and pd.notna(basket_6mo_pct.at[dt]):
+                line += f" [6mo: {basket_6mo_pct.at[dt]:+.1f}%]"
+            if basket_1yr_pct is not None and pd.notna(basket_1yr_pct.at[dt]):
+                line += f" [1yr: {basket_1yr_pct.at[dt]:+.1f}%]"
+            line += "</b>"
+            lines.append(line)
         else:
             lines.append(f"<b>{name}: ${basket_total:,.0f}</b>")
 
@@ -362,11 +464,18 @@ def make_hover_trace(total_series, name, stock_prices, stock_values, position_hi
             position = position_history.at[dt, ticker] if dt in position_history.index and ticker in position_history.columns else None
             pct_change = stock_pct.at[dt, ticker] if stock_pct is not None and ticker in stock_pct.columns else None
             if pd.notna(price) and pd.notna(value) and pd.notna(position) and position != 0:
-                lines.append(
-                    f"{ticker}: {position:.2f} × ${price:.2f} = ${value:,.0f} ({pct_change:+.1f}%)"
-                )
+                line = f"{ticker}: {position:.2f} × ${price:.2f} = ${value:,.0f} ({pct_change:+.1f}%)"
+                if stock_6mo_pct is not None and ticker in stock_6mo_pct.columns and pd.notna(stock_6mo_pct.at[dt, ticker]):
+                    line += f" [6mo: {stock_6mo_pct.at[dt, ticker]:+.1f}%]"
+                if stock_1yr_pct is not None and ticker in stock_1yr_pct.columns and pd.notna(stock_1yr_pct.at[dt, ticker]):
+                    line += f" [1yr: {stock_1yr_pct.at[dt, ticker]:+.1f}%]"
+                lines.append(line)
 
         hover_data.append("<br>".join(lines))
+
+    line_kwargs = {}
+    if line_color:
+        line_kwargs['color'] = line_color
 
     return go.Scatter(
         x=total_series.index,
@@ -374,11 +483,12 @@ def make_hover_trace(total_series, name, stock_prices, stock_values, position_hi
         mode='lines',
         name=name,
         hovertext=hover_data,
-        hoverinfo='text'
+        hoverinfo='text',
+        line=dict(**line_kwargs) if line_kwargs else None
     )
 
 
-def main():
+def main(include_sold_value=False):
     from datetime import date
     import pandas as pd
 
@@ -397,13 +507,27 @@ def main():
 
     data = download_stock_data(all_tickers, start_date, end_date)
 
-    value1, values1, prices1, positions1, pct1, stockpct1 = compute_basket_value(basket1, data)
-    value2, values2, prices2, positions2, pct2, stockpct2 = compute_basket_value(basket2, data)
+    value1, values1, prices1, positions1, pct1, stockpct1 = compute_basket_value(basket1, data, include_sold_value)
+    value2, values2, prices2, positions2, pct2, stockpct2 = compute_basket_value(basket2, data, include_sold_value)
+
+    # Compute trailing 6-month annualized percent change (starting Oct 10, 2025)
+    sixmo_start = pd.Timestamp('2025-10-10')
+    basket_6mo_1 = compute_trailing_6mo_annualized_pct(value1, sixmo_start)
+    basket_6mo_2 = compute_trailing_6mo_annualized_pct(value2, sixmo_start)
+    stock_6mo_1 = pd.DataFrame({col: compute_trailing_6mo_annualized_pct(prices1[col], sixmo_start) for col in prices1.columns})
+    stock_6mo_2 = pd.DataFrame({col: compute_trailing_6mo_annualized_pct(prices2[col], sixmo_start) for col in prices2.columns})
+
+    # Compute trailing 1-year percent change (starting April 10, 2026)
+    yr_start = pd.Timestamp('2026-04-10')
+    basket_1yr_1 = compute_trailing_1yr_pct(value1, yr_start)
+    basket_1yr_2 = compute_trailing_1yr_pct(value2, yr_start)
+    stock_1yr_1 = pd.DataFrame({col: compute_trailing_1yr_pct(prices1[col], yr_start) for col in prices1.columns})
+    stock_1yr_2 = pd.DataFrame({col: compute_trailing_1yr_pct(prices2[col], yr_start) for col in prices2.columns})
 
     fig = go.Figure()
 
-    fig.add_trace(make_hover_trace(value1, name1, prices1, values1, positions1, show_date=True, stock_pct=stockpct1, basket_pct=pct1))
-    fig.add_trace(make_hover_trace(value2, name2, prices2, values2, positions2, show_date=False, stock_pct=stockpct2, basket_pct=pct2))
+    fig.add_trace(make_hover_trace(value1, name1, prices1, values1, positions1, show_date=True, stock_pct=stockpct1, basket_pct=pct1, basket_1yr_pct=basket_1yr_1, stock_1yr_pct=stock_1yr_1, basket_6mo_pct=basket_6mo_1, stock_6mo_pct=stock_6mo_1, line_color='red'))
+    fig.add_trace(make_hover_trace(value2, name2, prices2, values2, positions2, show_date=False, stock_pct=stockpct2, basket_pct=pct2, basket_1yr_pct=basket_1yr_2, stock_1yr_pct=stock_1yr_2, basket_6mo_pct=basket_6mo_2, stock_6mo_pct=stock_6mo_2, line_color='blue'))
 
     # Add percent gain traces on secondary y-axis
     fig.add_trace(go.Scatter(
@@ -412,7 +536,7 @@ def main():
         mode='lines',
         name=f"{name1} (% gain)",
         yaxis="y2",
-        line=dict(dash='dot')
+        line=dict(dash='dot', color='red')
     ))
     fig.add_trace(go.Scatter(
         x=pct2.index,
@@ -420,11 +544,56 @@ def main():
         mode='lines',
         name=f"{name2} (% gain)",
         yaxis="y2",
-        line=dict(dash='dot')
+        line=dict(dash='dot', color='blue')
     ))
 
+    # Add trailing 6-month annualized percent change traces on secondary y-axis
+    b6mo1 = basket_6mo_1.dropna()
+    b6mo2 = basket_6mo_2.dropna()
+    if not b6mo1.empty:
+        fig.add_trace(go.Scatter(
+            x=b6mo1.index,
+            y=b6mo1.values,
+            mode='lines',
+            name=f"{name1} (6mo ann %)",
+            yaxis="y2",
+            line=dict(dash='dashdot', color='red')
+        ))
+    if not b6mo2.empty:
+        fig.add_trace(go.Scatter(
+            x=b6mo2.index,
+            y=b6mo2.values,
+            mode='lines',
+            name=f"{name2} (6mo ann %)",
+            yaxis="y2",
+            line=dict(dash='dashdot', color='blue')
+        ))
+
+    # Add trailing 1-year percent change traces on secondary y-axis
+    b1yr1 = basket_1yr_1.dropna()
+    b1yr2 = basket_1yr_2.dropna()
+    if not b1yr1.empty:
+        fig.add_trace(go.Scatter(
+            x=b1yr1.index,
+            y=b1yr1.values,
+            mode='lines',
+            name=f"{name1} (1yr %)",
+            yaxis="y2",
+            line=dict(dash='dash', color='red')
+        ))
+    if not b1yr2.empty:
+        fig.add_trace(go.Scatter(
+            x=b1yr2.index,
+            y=b1yr2.values,
+            mode='lines',
+            name=f"{name2} (1yr %)",
+            yaxis="y2",
+            line=dict(dash='dash', color='blue')
+        ))
+
+    title_suffix = " (Including Sold Amounts)" if include_sold_value else ""
     fig.update_layout(
-        title="Stock Basket Value Over Time",
+        title=f"Stock Basket Value Over Time{title_suffix}",
         xaxis_title="Date",
         yaxis=dict(title="Total Value ($)", side="left"),
         yaxis2=dict(title="Percent Change (%)", overlaying='y', side='right'),
@@ -440,4 +609,11 @@ def main():
     print('Goodbye, World')
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Plot stock basket values over time')
+    parser.add_argument('--include-sold', action='store_true',
+                       help='Include dollar amounts from sold stocks in the plot (calculations still based on actual holdings)')
+    args = parser.parse_args()
+
+    main(include_sold_value=args.include_sold)

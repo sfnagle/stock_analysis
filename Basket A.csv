@@ -1,5 +1,11 @@
-Ticker,Transaction Date,Transaction Type,Transaction Price,Quantity
-ACGBY,4/7/25,Buy,14.23,4135.35
-VOOG,4/7/25,Buy,310,228.04
-ONEQ,4/7/25,Buy,62.44,882.12
-AAPL,4/7/25,Buy,193.88,110.6
+Ticker,Transaction Date,Transaction Type,Transaction Price,Quantity,Value
+ACGBY,4/4/25,Buy,14.22,4135.352," $58,804.71 "
+VOOG,4/4/25,Buy,50.26,1368.2424," $68,767.86 "
+ONEQ,4/4/25,Buy,61.42,882.1226," $54,179.97 "
+AAPL,4/4/25,Buy,188.38,110.6045," $20,835.68 "
+VOOG,12/17/25,Sell,432.61,15," $6,489.15 "
+ONEQ,12/17/25,Sell,89.26,74," $6,605.24 "
+AAPL,12/17/25,Sell,271.84,24," $6,524.16 "
+VOOG,1/29/26,Sell,450.88,33.023427," $14,889.60 "
+ONEQ,1/29/26,Sell,93.11,159.914112," $14,889.60 "
+AAPL,1/29/26,Sell,258.28,57.649074," $14,889.60 "
